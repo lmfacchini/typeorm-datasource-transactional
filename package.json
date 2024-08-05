@@ -1,0 +1,23 @@
+{
+  "name": "typeorm-datasource-transactional",
+  "version": "1.0.1",
+  "description": "Implements Transactional Context in TypeORM",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Leonardo Marquini Facchini",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/core": "^10.0.0",
+    "typescript": "^5.5.3"
+  },
+  "dependencies": {
+    "rxjs": "^7.8.1",
+    "typeorm": "^0.3.20"
+  }
+}
