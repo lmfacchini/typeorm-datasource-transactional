@@ -1,6 +1,6 @@
 {
   "name": "typeorm-datasource-transactional",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Implements Transactional Context in TypeORM",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
