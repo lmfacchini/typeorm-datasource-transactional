@@ -19,12 +19,12 @@ import { TransactionException } from "./transactional.exception";
 export class TransactionalInterceptor implements NestInterceptor {
   constructor(
     private readonly reflector: Reflector,
-    private datasource: TransactedDataSource
+    private datasource: TransactedDataSource,
   ) {}
 
   async intercept(
     context: ExecutionContext,
-    next: CallHandler
+    next: CallHandler,
   ): Promise<Observable<any>> {
     const handler = context.getHandler();
     const classType = context.getClass();
@@ -40,7 +40,7 @@ export class TransactionalInterceptor implements NestInterceptor {
       }
       const queryRunner: QueryRunner | null = await this.before(
         request,
-        propagation
+        propagation,
       );
       if (queryRunner) {
         request.queryRunners.push(queryRunner);
@@ -52,7 +52,7 @@ export class TransactionalInterceptor implements NestInterceptor {
         catchError(async (err: Error) => {
           await this.after(request, propagation, queryRunner, err);
           throw err;
-        })
+        }),
       );
     }
     return next.handle();
@@ -114,7 +114,7 @@ export class TransactionalInterceptor implements NestInterceptor {
     request: any,
     propagation: Propagation,
     queryRunner: QueryRunner | null,
-    error?: Error
+    error?: Error,
   ): Promise<void> {
     if (queryRunner) {
       switch (propagation) {
@@ -133,7 +133,7 @@ export class TransactionalInterceptor implements NestInterceptor {
 
   private async release(queryRunner: QueryRunner): Promise<void> {
     if (!queryRunner.isReleased) {
-      await queryRunner.release();
+      await queryRunner.rollbackTransaction();
     }
   }
 
