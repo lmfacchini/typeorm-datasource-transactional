@@ -38,10 +38,7 @@ export class TransactionalInterceptor implements NestInterceptor {
       if (!request.queryRunners) {
         request.queryRunners = [];
       }
-      const queryRunner: QueryRunner | null = await this.before(
-        request,
-        propagation,
-      );
+      const queryRunner: QueryRunner | null = this.before(request, propagation);
       if (queryRunner) {
         request.queryRunners.push(queryRunner);
       }
@@ -123,6 +120,7 @@ export class TransactionalInterceptor implements NestInterceptor {
         case Propagation.SUPPORTS:
         case Propagation.MANDATORY:
           await this.effect(queryRunner, error);
+          break;
         case Propagation.NOT_SUPPORTED:
         case Propagation.NEVER:
           request.queryRunners.pop();
@@ -132,7 +130,7 @@ export class TransactionalInterceptor implements NestInterceptor {
   }
 
   private async release(queryRunner: QueryRunner): Promise<void> {
-    if (!queryRunner.isReleased) {
+    if (!queryRunner.isReleased && !queryRunner.isTransactionActive) {
       await queryRunner.rollbackTransaction();
     }
   }
