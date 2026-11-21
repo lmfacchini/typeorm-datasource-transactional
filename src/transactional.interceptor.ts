@@ -5,143 +5,146 @@ import {
   CallHandler,
 } from "@nestjs/common";
 import { Reflector } from "@nestjs/core";
-import { Observable } from "rxjs";
-import { catchError, tap } from "rxjs/operators";
+import { Observable, defer, from, lastValueFrom } from "rxjs";
+import { QueryRunner } from "typeorm";
+import { TransactedDataSource } from "./transacted-datasource";
 import {
   Propagation,
   TRANSACTIONAL_DECORATOR_KEY,
 } from "./transactional.decorator";
-import { TransactedDataSource } from "./transacted-datasource";
-import { QueryRunner } from "typeorm";
 import { TransactionException } from "./transactional.exception";
+
+interface TransactionalRequest {
+  queryRunners?: QueryRunner[];
+}
 
 @Injectable()
 export class TransactionalInterceptor implements NestInterceptor {
   constructor(
     private readonly reflector: Reflector,
-    private datasource: TransactedDataSource,
+    private readonly datasource: TransactedDataSource,
   ) {}
 
-  async intercept(
-    context: ExecutionContext,
-    next: CallHandler,
-  ): Promise<Observable<any>> {
-    const handler = context.getHandler();
-    const classType = context.getClass();
-
-    const propagation: Propagation | undefined =
-      this.reflector.get<Propagation>(TRANSACTIONAL_DECORATOR_KEY, handler) ||
-      this.reflector.get<Propagation>(TRANSACTIONAL_DECORATOR_KEY, classType);
-
-    if (propagation) {
-      const request = context.switchToHttp().getRequest();
-      if (!request.queryRunners) {
-        request.queryRunners = [];
-      }
-      const queryRunner: QueryRunner | null = this.before(request, propagation);
-      if (queryRunner) {
-        request.queryRunners.push(queryRunner);
-      }
-      return next.handle().pipe(
-        tap(async () => {
-          await this.after(request, propagation, queryRunner);
-        }),
-        catchError(async (err: Error) => {
-          await this.after(request, propagation, queryRunner, err);
-          throw err;
-        }),
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const propagation =
+      this.reflector.get<Propagation>(
+        TRANSACTIONAL_DECORATOR_KEY,
+        context.getHandler(),
+      ) ??
+      this.reflector.get<Propagation>(
+        TRANSACTIONAL_DECORATOR_KEY,
+        context.getClass(),
       );
+
+    if (propagation === undefined) {
+      return next.handle();
     }
-    return next.handle();
+
+    const request = context.switchToHttp().getRequest<TransactionalRequest>();
+
+    // Run the whole transaction lifecycle inside the Observable subscription.
+    // The HTTP response is not completed before commit/rollback and release.
+    return defer(() => from(this.execute(request, propagation, next)));
   }
 
-  private createQueryRunner(): QueryRunner {
-    return this.datasource.createQueryRunner();
-  }
+  private async execute(
+    request: TransactionalRequest,
+    propagation: Propagation,
+    next: CallHandler,
+  ): Promise<any> {
+    const stack = (request.queryRunners ??= []);
+    const current = stack[stack.length - 1];
+    const active = current?.isTransactionActive ?? false;
 
-  private createTransaction(): QueryRunner {
-    const queryRunner: QueryRunner = this.createQueryRunner();
-    queryRunner.startTransaction();
-    return queryRunner;
-  }
+    let createRunner = false;
+    let startTransaction = false;
 
-  private before(request: any, propagation: Propagation): QueryRunner | null {
     switch (propagation) {
       case Propagation.REQUIRED:
-        if (request.queryRunners.length > 0) {
-          break;
-        }
+        // An existing non-transactional runner cannot satisfy REQUIRED.
+        createRunner = !active;
+        startTransaction = !active;
+        break;
+
       case Propagation.REQUIRES_NEW:
-        return this.createTransaction();
+        createRunner = true;
+        startTransaction = true;
+        break;
+
       case Propagation.MANDATORY:
-        if (
-          request.queryRunners.length === 0 ||
-          !request.queryRunners[request.queryRunners.length - 1]
-            .isTransactionActive
-        ) {
+        if (!active) {
           throw new TransactionException("Transaction is required");
         }
         break;
 
       case Propagation.NEVER:
-        if (
-          request.queryRunners.length > 0 &&
-          request.queryRunners[request.queryRunners.length - 1]
-            .isTransactionActive
-        ) {
+        if (active) {
           throw new TransactionException("Transaction is not supported");
         }
+        createRunner = !current;
+        break;
+
       case Propagation.NOT_SUPPORTED:
-        if (
-          request.queryRunners.length > 0 &&
-          !request.queryRunners[request.queryRunners.length - 1]
-            .isTransactionActive
-        ) {
-          break;
-        }
+        // Temporarily shadow an active transaction with a non-transactional runner.
+        createRunner = !current || active;
+        break;
+
       case Propagation.SUPPORTS:
-        if (request.queryRunners.length === 0) {
-          return this.createQueryRunner();
+        // The repositories still need a runner when no transaction exists.
+        createRunner = !current;
+        break;
+    }
+
+    if (!createRunner) {
+      // The outer scope owns this runner: never commit, rollback or release it here.
+      return lastValueFrom(next.handle(), { defaultValue: undefined });
+    }
+
+    const runner = this.datasource.createQueryRunner();
+    let pushed = false;
+
+    try {
+      if (startTransaction) {
+        // startTransaction can acquire a connection; wait before invoking handlers.
+        await runner.startTransaction();
+      }
+
+      stack.push(runner);
+      pushed = true;
+
+      // NestJS HTTP handlers normally emit a single response value.
+      // Converting to a Promise ensures commit and cleanup are awaited.
+      const result = await lastValueFrom(next.handle(), {
+        defaultValue: undefined,
+      });
+
+      if (startTransaction) {
+        await runner.commitTransaction();
+      }
+
+      return result;
+    } finally {
+      try {
+        // Roll back on handler/commit failure, including failed startup if active.
+        if (!runner.isReleased && runner.isTransactionActive) {
+          await runner.rollbackTransaction();
         }
-    }
-    return null;
-  }
-
-  private async after(
-    request: any,
-    propagation: Propagation,
-    queryRunner: QueryRunner | null,
-    error?: Error,
-  ): Promise<void> {
-    if (queryRunner) {
-      switch (propagation) {
-        case Propagation.REQUIRES_NEW:
-        case Propagation.REQUIRED:
-        case Propagation.SUPPORTS:
-        case Propagation.MANDATORY:
-          await this.effect(queryRunner, error);
-          break;
-        case Propagation.NOT_SUPPORTED:
-        case Propagation.NEVER:
-          request.queryRunners.pop();
-          await this.release(queryRunner);
+      } finally {
+        try {
+          // Commit/rollback do not return the connection to pg-pool.
+          if (!runner.isReleased) {
+            await runner.release();
+          }
+        } finally {
+          if (pushed) {
+            // Restore even if another nested scope changed the stack.
+            const index = stack.lastIndexOf(runner);
+            if (index !== -1) {
+              stack.splice(index, 1);
+            }
+          }
+        }
       }
-    }
-  }
-
-  private async release(queryRunner: QueryRunner): Promise<void> {
-    if (!queryRunner.isReleased && !queryRunner.isTransactionActive) {
-      await queryRunner.rollbackTransaction();
-    }
-  }
-
-  private async effect(queryRunner: QueryRunner, error?: Error): Promise<void> {
-    if (error) {
-      if (queryRunner.isTransactionActive) {
-        await queryRunner.rollbackTransaction();
-      }
-    } else if (queryRunner.isTransactionActive) {
-      await queryRunner.commitTransaction();
     }
   }
 }
